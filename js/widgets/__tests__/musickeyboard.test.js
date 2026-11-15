@@ -18,6 +18,8 @@ const ManagedTimer = require("../../utils/ManagedTimer");
 // by the constructor, so they must be global before a keyboard is made.
 global.MusicKeyboardEditing = require("../MusicKeyboardEditing.js");
 global.MusicKeyboardRendering = require("../MusicKeyboardRendering.js");
+global.MusicKeyboardPlayback = require("../MusicKeyboardPlayback.js");
+global.MusicKeyboardInput = require("../MusicKeyboardInput.js");
 const MusicKeyboard = require("../musickeyboard.js");
 
 // Shared across instances. reset between tests.
@@ -1464,6 +1466,72 @@ describe("MusicKeyboard widgetWindow.onclose & event cleanup", () => {
             return keyboard;
         };
 
+        describe("Shift + Arrow octave shift", () => {
+            const keyOf = (keyboard, noteName) =>
+                keyboard.displayLayout.find(key => key.noteName === noteName);
+
+            test("moves every key, white and black, to the new octave", () => {
+                const keyboard = initKeyboard(["do", "sol"]);
+                const before = keyboard.displayLayout.map(key => key.noteOctave);
+
+                keyboard.shiftOctave(1);
+
+                expect(keyboard.displayLayout.map(key => key.noteOctave)).toEqual(
+                    before.map(octave => octave + 1)
+                );
+                for (const key of keyboard.displayLayout) {
+                    const element = document.getElementById(key.objId);
+                    const [noteName, octave] = element.getAttribute("alt").split("__");
+                    expect([noteName, Number(octave)]).toEqual([key.noteName, key.noteOctave]);
+                    expect(keyboard.noteMapper[key.objId]).toMatch(
+                        new RegExp(key.noteOctave + "$")
+                    );
+                }
+                expect(document.getElementById(keyOf(keyboard, "C").objId).textContent).toContain(
+                    "5"
+                );
+            });
+
+            test("the computer keyboard plays the shifted notes", () => {
+                const keyboard = initKeyboard(["do", "sol"]);
+                const { trigger } = mockActivity.logo.synth;
+
+                keyboard.shiftOctave(1);
+                // A is the first white key (C), W the second black key (D sharp).
+                document.onkeydown({ keyCode: 65 });
+                document.onkeydown({ keyCode: 87 });
+
+                expect(trigger.mock.calls.map(call => call[1])).toEqual(["C5", "D#5"]);
+            });
+
+            test("shifting down moves the keys down an octave", () => {
+                const keyboard = initKeyboard(["do", "sol"]);
+                const { trigger } = mockActivity.logo.synth;
+
+                keyboard.shiftOctave(-1);
+                document.onkeydown({ keyCode: 65 });
+
+                expect(keyboard.noteMapper[keyOf(keyboard, "G").objId]).toBe("G3");
+                expect(trigger).toHaveBeenLastCalledWith(0, "C3", 1, "guitar", null, null);
+            });
+
+            test("ends a key that is held while the octave changes", () => {
+                const keyboard = initKeyboard(["do", "sol"]);
+                const { stopSound } = mockActivity.logo.synth;
+                keyboard._notesPlayed = [];
+
+                document.onkeydown({ keyCode: 65 });
+                keyboard.shiftOctave(1);
+
+                expect(stopSound).toHaveBeenCalledWith(0, "guitar", "C4");
+                expect(keyboard._notesPlayed.map(note => note.noteOctave)).toEqual(["C4"]);
+
+                // The release no longer belongs to any held note.
+                document.onkeyup({ keyCode: 65 });
+                expect(keyboard._notesPlayed).toHaveLength(1);
+            });
+        });
+
         const keyLabelFor = blockNumber => {
             const cell = [...document.querySelectorAll("td")].find(td =>
                 td.getAttribute("alt")?.endsWith("__" + blockNumber)
@@ -2087,10 +2155,7 @@ describe("MusicKeyboard core logic", () => {
         });
 
         test("rounds to the nearest eighth in beginner mode", () => {
-            const savedBeginnerMode = global.localStorage.beginnerMode;
-            global.localStorage.beginnerMode = "true";
-            const keyboard = new MusicKeyboard({});
-            global.localStorage.beginnerMode = savedBeginnerMode;
+            const keyboard = new MusicKeyboard({ beginnerMode: true });
 
             expect(keyboard._roundNoteDuration(0.2)).toBeCloseTo(0.25);
         });
@@ -2609,8 +2674,7 @@ describe("MusicKeyboard note duration rounding and key handlers", () => {
     });
 
     test("rounds raw note durations to 1/8th grid in beginner mode", () => {
-        localStorage.beginnerMode = "true";
-        const keyboard = new MusicKeyboard({});
+        const keyboard = new MusicKeyboard({ beginnerMode: true });
 
         // 0.26s -> 0.25s (nearest 1/8th)
         expect(keyboard._roundNoteDuration(0.26)).toBe(0.25);
@@ -2618,6 +2682,17 @@ describe("MusicKeyboard note duration rounding and key handlers", () => {
         expect(keyboard._roundNoteDuration(0.19)).toBe(0.25);
         // 0s falls back to 0.125s minimum
         expect(keyboard._roundNoteDuration(0)).toBe(0.125);
+    });
+
+    test("uses the activity's mode, not the stored value, which is unset for a new user", () => {
+        delete localStorage.beginnerMode;
+        const newUser = new MusicKeyboard({ beginnerMode: true });
+        expect(newUser._roundNoteDuration(0.19)).toBe(0.25);
+
+        // The activity decides, even when the stored value says otherwise.
+        localStorage.beginnerMode = "true";
+        const advanced = new MusicKeyboard({ beginnerMode: false });
+        expect(advanced._roundNoteDuration(0.19)).toBe(0.1875);
     });
 
     test("tracks keyboard ownership of the document key handlers", () => {
@@ -2824,36 +2899,6 @@ describe("MusicKeyboard note duration rounding and key handlers", () => {
         document.onkeyup(noteEvent);
 
         expect(keyboard._notesPlayed).toEqual([]);
-    });
-
-    test("shiftOctave updates DOM elements attributes and text nodes", () => {
-        const cell = document.createElement("td");
-        cell.id = "cell-0";
-        cell.setAttribute = jest.fn();
-        const textNode = document.createTextNode("C4");
-        cell.appendChild(textNode);
-
-        const origDocById = global.docById;
-        global.docById = jest.fn(id =>
-            id === "cell-0" ? cell : { style: {}, replaceChildren: jest.fn() }
-        );
-
-        const keyboard = new MusicKeyboard({});
-        keyboard.keyTable = { style: {}, replaceChildren: jest.fn(), append: jest.fn() };
-        keyboard.noteNames = ["C"];
-        keyboard.octaves = [4];
-        keyboard.displayLayout = [{ noteName: "C", noteOctave: 4 }];
-        keyboard.noteMapper = {};
-        keyboard.layout = [{ noteName: "C", noteOctave: 4 }];
-
-        keyboard.shiftOctave(1);
-
-        expect(cell.setAttribute).toHaveBeenCalledWith("alt", "C5");
-        expect(cell.setAttribute).toHaveBeenCalledWith("title", "C5");
-        expect(textNode.textContent).toBe("C5");
-        expect(keyboard.noteMapper["cell-0"]).toBe("C5");
-
-        global.docById = origDocById;
     });
 });
 
@@ -3220,6 +3265,7 @@ describe("MusicKeyboard rest key pointer handler", () => {
             logo: { synth: { trigger: jest.fn(), stopSound: jest.fn() } }
         });
         keyboard._notesPlayed = [];
+        keyboard.bpm = 120;
         keyboard._createTable = jest.fn();
         keyboard._updateWidgetWindowSize = jest.fn();
         element = {
@@ -3237,16 +3283,17 @@ describe("MusicKeyboard rest key pointer handler", () => {
         jest.useRealTimers();
     });
 
-    test("records a rest lasting as long as the key was held", () => {
+    test("records a rest lasting as long as the key was held, at the tempo", () => {
         const start = Date.now();
         listener("pointerdown")({ preventDefault: jest.fn(), pointerId: 1 });
         expect(element.style.backgroundColor).toBe("orange");
 
+        // Half a second is one quarter note at 120 bpm.
         jest.advanceTimersByTime(500);
         listener("pointerup")();
 
         expect(keyboard._notesPlayed).toEqual([
-            { startTime: start, noteOctave: "R", objId: null, duration: 0.5 }
+            { startTime: start, noteOctave: "R", objId: null, duration: 0.25 }
         ]);
         expect(element.style.backgroundColor).toBe("white");
         expect(keyboard._createTable).toHaveBeenCalled();
@@ -3265,5 +3312,60 @@ describe("MusicKeyboard rest key pointer handler", () => {
         listener("pointerup")();
 
         expect(keyboard._notesPlayed).toEqual([]);
+    });
+});
+
+describe("MusicKeyboard recorded note values follow the tempo", () => {
+    let originalPlatformColor;
+
+    beforeEach(() => {
+        jest.useFakeTimers();
+        jest.setSystemTime(new Date(2026, 0, 1, 0, 0, 0));
+        originalPlatformColor = global.platformColor;
+        global.platformColor = { orange: "orange" };
+        delete localStorage.beginnerMode;
+    });
+
+    afterEach(() => {
+        global.platformColor = originalPlatformColor;
+        jest.useRealTimers();
+    });
+
+    test.each([60, 90, 120])("_secondsToNoteValue undoes the playback timing at %i bpm", bpm => {
+        const keyboard = new MusicKeyboard({});
+        keyboard.bpm = bpm;
+
+        // playAll and playOne play a note value for value * 60 * 4 / bpm seconds.
+        for (const value of [1 / 16, 1 / 8, 1 / 4, 3 / 8, 1]) {
+            expect(keyboard._secondsToNoteValue((value * 60 * 4) / bpm)).toBeCloseTo(value);
+        }
+    });
+
+    test("a key clicked for one beat records a quarter note", () => {
+        const keyboard = new MusicKeyboard({
+            logo: { synth: { trigger: jest.fn(), stopSound: jest.fn() } }
+        });
+        keyboard.bpm = 90;
+        keyboard._notesPlayed = [];
+        keyboard._createTable = jest.fn();
+        keyboard._updateWidgetWindowSize = jest.fn();
+        keyboard.displayLayout = [{ noteName: "C", noteOctave: 4, voice: "piano" }];
+        const element = {
+            id: "whiteRow0",
+            addEventListener: jest.fn(),
+            style: {},
+            setPointerCapture: jest.fn()
+        };
+        const listener = type =>
+            element.addEventListener.mock.calls.find(call => call[0] === type)[1];
+        keyboard.loadHandler(element, 0, 44);
+
+        listener("pointerdown")({ preventDefault: jest.fn(), pointerId: 1 });
+        // One beat at 90 bpm.
+        jest.advanceTimersByTime(60000 / 90);
+        listener("pointerup")();
+
+        expect(keyboard._notesPlayed).toHaveLength(1);
+        expect(keyboard._notesPlayed[0]).toMatchObject({ noteOctave: "C4", duration: 0.25 });
     });
 });

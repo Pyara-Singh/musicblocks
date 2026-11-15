@@ -177,6 +177,8 @@ global.MusicKeyboard = jest.fn();
 global.MusicKeyboard.dependencies = [
     "widgets/MusicKeyboardEditing",
     "widgets/MusicKeyboardRendering",
+    "widgets/MusicKeyboardPlayback",
+    "widgets/MusicKeyboardInput",
     "widgets/musickeyboard"
 ];
 global.PhraseMaker = jest.fn();
@@ -558,6 +560,8 @@ describe("setupWidgetBlocks", () => {
             runBlock(widget([], []));
 
             expect(logo.inPitchDrumMatrix).toBe(true);
+            // So the selected cells are saved on this block.
+            expect(logo.pitchDrumMatrix.blockNo).toBe("pdmBlk");
             expect(logo.setDispatchBlock).toHaveBeenCalledWith("pdmBlk", 0, "_pitchdrummatrix_0");
         });
 
@@ -619,6 +623,95 @@ describe("setupWidgetBlocks", () => {
             meterWidget.flow(["childBlk"], logo, 0, "meterBlk");
             expect(logo.setDispatchBlock).toHaveBeenCalledWith("meterBlk", 0, "_meterwidget_0");
             expect(logo.setTurtleListener).toHaveBeenCalled();
+        });
+
+        // Meter 3 beats with the beat value 1 / 4, or as one number block.
+        const openMeterWidget = beatValueBlocks => {
+            activity.blocks.blockList = {
+                1: { name: "meter", connections: [null, 2, 3] },
+                2: { name: "number", value: 3 },
+                ...beatValueBlocks
+            };
+            global.MeterWidget.mockClear();
+            getBlock("meterwidget").flow(["childBlk"], logo, 0, "meterBlk");
+            logo._meterBlock = 1;
+            logo.setTurtleListener.mock.calls[0][2]();
+        };
+
+        it("opens the widget for a beat value of 1 / 4", () => {
+            openMeterWidget({
+                3: { name: "divide", value: 0.25, connections: [1, 4, 5] },
+                4: { name: "number", value: 1 },
+                5: { name: "number", value: 4 }
+            });
+
+            expect(global.MeterWidget).toHaveBeenCalledTimes(1);
+        });
+
+        it("opens the widget for a beat value given as one number", () => {
+            openMeterWidget({ 3: { name: "number", value: 0.25, connections: [1] } });
+
+            expect(global.MeterWidget).toHaveBeenCalledTimes(1);
+            expect(logo.insideMeterWidget).toBe(false);
+        });
+
+        it("opens the widget for a beat value of 0 + 0.25", () => {
+            openMeterWidget({
+                3: { name: "plus", value: 0.25, connections: [1, 4, 5] },
+                4: { name: "number", value: 0 },
+                5: { name: "number", value: 0.25 }
+            });
+
+            expect(global.MeterWidget).toHaveBeenCalledTimes(1);
+        });
+
+        it.each([
+            ["is 0", { 3: { name: "number", value: 0, connections: [1] } }],
+            [
+                "is 1 - 1",
+                {
+                    3: { name: "minus", value: 0, connections: [1, 4, 5] },
+                    4: { name: "number", value: 1 },
+                    5: { name: "number", value: 1 }
+                }
+            ],
+            [
+                "is 0 / 4",
+                {
+                    3: { name: "divide", value: 0 / 4, connections: [1, 4, 5] },
+                    4: { name: "number", value: 0 },
+                    5: { name: "number", value: 4 }
+                }
+            ],
+            [
+                "is -1 / 4",
+                {
+                    3: { name: "divide", value: -1 / 4, connections: [1, 4, 5] },
+                    4: { name: "number", value: -1 },
+                    5: { name: "number", value: 4 }
+                }
+            ],
+            [
+                "is 1 / -4",
+                {
+                    3: { name: "divide", value: 1 / -4, connections: [1, 4, 5] },
+                    4: { name: "number", value: 1 },
+                    5: { name: "number", value: -4 }
+                }
+            ],
+            [
+                "has no denominator",
+                {
+                    3: { name: "divide", value: 0, connections: [1, 4, null] },
+                    4: { name: "number", value: 1 }
+                }
+            ],
+            ["is missing", {}]
+        ])("does not open the widget when the beat value %s", (_label, beatValueBlocks) => {
+            openMeterWidget(beatValueBlocks);
+
+            expect(global.MeterWidget).not.toHaveBeenCalled();
+            expect(logo.insideMeterWidget).toBe(false);
         });
     });
 
@@ -913,6 +1006,159 @@ describe("setupWidgetBlocks", () => {
         });
     });
 
+    describe("Loading widget modules with RequireJS", () => {
+        let loads;
+        const failLoad = load => load.ids.forEach(id => load.onError({ requireModules: [id] }));
+
+        beforeEach(() => {
+            loads = [];
+            global.define = Object.assign(jest.fn(), { amd: {} });
+            global.requirejs = Object.assign(
+                jest.fn((ids, done, onError) => loads.push({ ids, done, onError })),
+                { undef: jest.fn() }
+            );
+            logo.runGeneration = 0;
+            logo.doStopTurtles = jest.fn(() => (logo.runGeneration += 1));
+            global.Oscilloscope.mockClear();
+            global.ChordBuilderWidget.mockClear();
+        });
+
+        afterEach(() => {
+            delete global.define;
+            delete global.requirejs;
+        });
+
+        const runTemperament = receivedArg =>
+            getBlock("temperament").flow([0, "childBlk"], logo, 0, "tempBlk", receivedArg);
+
+        it("resumes the block once the modules arrive", () => {
+            expect(runTemperament("received")).toEqual([null, 0, true]);
+            expect(logo.runFromBlockNow).not.toHaveBeenCalled();
+
+            loads[0].done();
+
+            expect(logo.runFromBlockNow).toHaveBeenCalledWith(logo, 0, "tempBlk", true, "received");
+        });
+
+        it("reports a failed load once, stops the run and fetches again on the next try", () => {
+            runTemperament("received");
+            failLoad(loads[0]);
+
+            expect(global.requirejs.undef.mock.calls).toEqual(loads[0].ids.map(id => [id]));
+            expect(activity.errorMsg).toHaveBeenCalledTimes(1);
+            expect(logo.doStopTurtles).toHaveBeenCalledTimes(1);
+            expect(logo.temperament).toBeNull();
+
+            runTemperament("received");
+            // RequireJS also calls back the failed request once the retry loads the modules.
+            loads[0].done();
+            loads[1].done();
+
+            expect(logo.runFromBlockNow).toHaveBeenCalledTimes(1);
+            expect(logo.temperament).not.toBe("loading");
+        });
+
+        it("does not resume a block from a run that was stopped while loading", () => {
+            runTemperament("received");
+            logo.runGeneration += 2;
+
+            loads[0].done();
+
+            expect(logo.runFromBlockNow).not.toHaveBeenCalled();
+            expect(logo.temperament).not.toBe("loading");
+        });
+
+        it("resumes only the block run again after a stop while loading", () => {
+            runTemperament("first run");
+            logo.runGeneration += 2;
+            runTemperament("second run");
+
+            expect(loads).toHaveLength(1);
+            loads[0].done();
+
+            expect(logo.runFromBlockNow).toHaveBeenCalledTimes(1);
+            expect(logo.runFromBlockNow).toHaveBeenCalledWith(
+                logo,
+                0,
+                "tempBlk",
+                true,
+                "second run"
+            );
+        });
+
+        it("does not resume the next waiting block once a resumed one stops the run", () => {
+            const temperament = getBlock("temperament");
+            temperament.flow([0, "childBlk"], logo, 0, "tempBlk1", "received");
+            temperament.flow([0, "childBlk"], logo, 1, "tempBlk2", "received");
+            logo.runFromBlockNow.mockImplementation(() => logo.doStopTurtles());
+
+            loads[0].done();
+
+            expect(logo.runFromBlockNow).toHaveBeenCalledTimes(1);
+            expect(logo.runFromBlockNow).toHaveBeenCalledWith(
+                logo,
+                0,
+                "tempBlk1",
+                true,
+                "received"
+            );
+        });
+
+        it("stays quiet about a failed load from a run that was stopped", () => {
+            runTemperament("received");
+            logo.runGeneration += 2;
+
+            failLoad(loads[0]);
+
+            expect(activity.errorMsg).not.toHaveBeenCalled();
+            expect(logo.doStopTurtles).not.toHaveBeenCalled();
+            expect(logo.temperament).toBeNull();
+        });
+
+        describe("from a clamp listener", () => {
+            const runOscilloscopeListener = () => {
+                getBlock("oscilloscope").flow(["childBlk"], logo, 0, "oscBlk");
+                logo.setTurtleListener.mock.calls[0][2]();
+            };
+
+            it("opens the widget once the modules arrive", () => {
+                runOscilloscopeListener();
+                loads[0].done();
+
+                expect(global.Oscilloscope).toHaveBeenCalledTimes(1);
+                expect(logo.inOscilloscope).toBe(false);
+            });
+
+            it("does not open the widget for a run that was stopped while loading", () => {
+                runOscilloscopeListener();
+                logo.runGeneration += 1;
+                loads[0].done();
+
+                expect(global.Oscilloscope).not.toHaveBeenCalled();
+                expect(logo.Oscilloscope).toBeNull();
+            });
+
+            it("reports a failed load and leaves the oscilloscope mode", () => {
+                runOscilloscopeListener();
+                failLoad(loads[0]);
+
+                expect(activity.errorMsg).toHaveBeenCalledTimes(1);
+                expect(logo.inOscilloscope).toBe(false);
+                expect(global.Oscilloscope).not.toHaveBeenCalled();
+            });
+
+            it("lets the Chord Builder load again after a load from a stopped run", () => {
+                getBlock("chordbuilder").flow(["childBlk"], logo, 0, "chordBlk");
+                logo.setTurtleListener.mock.calls[0][2]();
+                logo.runGeneration += 1;
+                loads[0].done();
+
+                expect(global.ChordBuilderWidget).not.toHaveBeenCalled();
+                expect(logo.chordBuilderWidget).toBeNull();
+            });
+        });
+    });
+
     describe("TemperamentBlock", () => {
         let temperament;
 
@@ -1127,6 +1373,25 @@ describe("setupWidgetBlocks", () => {
             expect(logo.reflection.init).toHaveBeenCalledTimes(1);
             expect(logo.inReflectionMatrix).toBe(false);
         });
+
+        it("leaves the Status widget's fields alone", () => {
+            const reflection = getBlock("reflection");
+            const fields = [
+                ["xBlk", "x"],
+                ["bpmBlk", "bpm"]
+            ];
+            logo.statusFields = fields;
+
+            reflection.flow(["childBlk"], logo, 0, "reflBlk", "received");
+            reflection.flow(["childBlk"], logo, 0, "reflBlk");
+            logo.setTurtleListener.mock.calls[0][2]();
+
+            expect(logo.statusFields).toBe(fields);
+            expect(logo.statusFields).toEqual([
+                ["xBlk", "x"],
+                ["bpmBlk", "bpm"]
+            ]);
+        });
     });
 
     describe("Widget dependency resolution", () => {
@@ -1237,7 +1502,7 @@ describe("setupWidgetBlocks", () => {
                 activity.blocks.blockList = {
                     1: { connections: [null, 2, 3] },
                     2: { value: 4 },
-                    3: { connections: [null, 4, 5] },
+                    3: { name: "divide", connections: [null, 4, 5] },
                     4: { value: 1 },
                     5: { value: 4 }
                 };
@@ -1260,7 +1525,7 @@ describe("setupWidgetBlocks", () => {
             activity.blocks.blockList = {
                 1: { connections: [null, 2, 3] },
                 2: { value: 4 },
-                3: { connections: [null, 4, 5] },
+                3: { name: "divide", connections: [null, 4, 5] },
                 4: { value: 1 },
                 5: { value: 4 }
             };
@@ -1294,7 +1559,7 @@ describe("setupWidgetBlocks", () => {
             activity.blocks.blockList = {
                 1: { connections: [null, 2, 3] },
                 2: { value: 4 },
-                3: { connections: [null, 4, 5] },
+                3: { name: "divide", connections: [null, 4, 5] },
                 4: { value: 1 },
                 5: { value: 4 }
             };
